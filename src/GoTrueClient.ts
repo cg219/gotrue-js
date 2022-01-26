@@ -1,8 +1,10 @@
-// deno-lint-ignore-file camelcase no-explicit-any
-import GoTrueApi, { ApiError } from './GoTrueApi.ts'
+import GoTrueApi from './GoTrueApi.ts'
 import { isBrowser, getParameterByName, uuid } from './lib/helpers.ts'
 import { GOTRUE_URL, DEFAULT_HEADERS, STORAGE_KEY } from './lib/constants.ts'
-import {
+import { polyfillGlobalThis } from './lib/polyfills.ts'
+
+import type {
+  ApiError,
   Session,
   User,
   UserAttributes,
@@ -13,7 +15,6 @@ import {
   UserCredentials,
   VerifyOTPParams,
 } from './lib/types.ts'
-import { polyfillGlobalThis } from './lib/polyfills.ts'
 
 polyfillGlobalThis() // Make "globalThis" available
 
@@ -22,6 +23,7 @@ const DEFAULT_OPTIONS = {
   autoRefreshToken: true,
   persistSession: true,
   detectSessionInUrl: true,
+  multiTab: true,
   headers: DEFAULT_HEADERS,
 }
 
@@ -30,8 +32,8 @@ type MaybePromisify<T> = T | Promise<T>
 
 type PromisifyMethods<T> = {
   [K in keyof T]: T[K] extends AnyFunction
-    ? (...args: Parameters<T[K]>) => MaybePromisify<ReturnType<T[K]>>
-    : T[K]
+  ? (...args: Parameters<T[K]>) => MaybePromisify<ReturnType<T[K]>>
+  : T[K]
 }
 
 type SupportedStorage = PromisifyMethods<Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>>
@@ -54,6 +56,7 @@ export default class GoTrueClient {
   protected autoRefreshToken: boolean
   protected persistSession: boolean
   protected localStorage: SupportedStorage
+  protected multiTab: boolean
   protected stateChangeEmitters: Map<string, Subscription> = new Map()
   protected refreshTokenTimer?: ReturnType<typeof setTimeout>
 
@@ -64,7 +67,8 @@ export default class GoTrueClient {
    * @param options.detectSessionInUrl Set to "true" if you want to automatically detects OAuth grants in the URL and signs in the user.
    * @param options.autoRefreshToken Set to "true" if you want to automatically refresh the token before expiring.
    * @param options.persistSession Set to "true" if you want to automatically save the user session into local storage.
-   * @param options.localStorage
+   * @param options.localStorage Provide your own local storage implementation to use instead of the browser's local storage.
+   * @param options.multiTab Set to "false" if you want to disable multi-tab/window events.
    * @param options.cookieOptions
    */
   constructor(options: {
@@ -73,7 +77,8 @@ export default class GoTrueClient {
     detectSessionInUrl?: boolean
     autoRefreshToken?: boolean
     persistSession?: boolean
-    localStorage?: Storage
+    localStorage?: SupportedStorage
+    multiTab?: boolean
     cookieOptions?: CookieOptions
   }) {
     const settings = { ...DEFAULT_OPTIONS, ...options }
@@ -81,17 +86,19 @@ export default class GoTrueClient {
     this.currentSession = null
     this.autoRefreshToken = settings.autoRefreshToken
     this.persistSession = settings.persistSession
+    this.multiTab = settings.multiTab
     this.localStorage = settings.localStorage || globalThis.localStorage
     this.api = new GoTrueApi({
       url: settings.url,
       headers: settings.headers,
-      cookieOptions: settings.cookieOptions,
+      cookieOptions: settings.cookieOptions
     })
     this._recoverSession()
     this._recoverAndRefresh()
+    this._listenForMultiTabEvents()
 
-    // Handle the OAuth redirect
     if (settings.detectSessionInUrl && isBrowser() && !!getParameterByName('access_token')) {
+      // Handle the OAuth redirect
       this.getSessionFromUrl({ storeSession: true }).then(({ error }) => {
         if (error) {
           console.error('Error getting session from URL.', error)
@@ -113,13 +120,13 @@ export default class GoTrueClient {
     { email, password, phone }: UserCredentials,
     options: {
       redirectTo?: string
-      data?: Record<string, unknown>
+      data?: object
+      captchaToken?: string
     } = {}
   ): Promise<{
     user: User | null
     session: Session | null
     error: ApiError | null
-    data: Session | User | null // Deprecated
   }> {
     try {
       this._removeSession()
@@ -127,12 +134,14 @@ export default class GoTrueClient {
       const { data, error } =
         phone && password
           ? await this.api.signUpWithPhone(phone!, password!, {
-              data: options.data,
-            })
+            data: options.data,
+            captchaToken: options.captchaToken,
+          })
           : await this.api.signUpWithEmail(email!, password!, {
-              redirectTo: options.redirectTo,
-              data: options.data,
-            })
+            redirectTo: options.redirectTo,
+            data: options.data,
+            captchaToken: options.captchaToken,
+          })
 
       if (error) {
         throw error
@@ -156,9 +165,9 @@ export default class GoTrueClient {
         user = data as User
       }
 
-      return { data, user, session, error: null }
+      return { user, session, error: null }
     } catch (e) {
-      return { data: null, user: null, session: null, error: e }
+      return { user: null, session: null, error: e as ApiError }
     }
   }
 
@@ -177,6 +186,7 @@ export default class GoTrueClient {
     options: {
       redirectTo?: string
       scopes?: string
+      captchaToken?: string
     } = {}
   ): Promise<{
     session: Session | null
@@ -184,7 +194,6 @@ export default class GoTrueClient {
     provider?: Provider
     url?: string | null
     error: ApiError | null
-    data: Session | null // Deprecated
   }> {
     try {
       this._removeSession()
@@ -192,8 +201,9 @@ export default class GoTrueClient {
       if (email && !password) {
         const { error } = await this.api.sendMagicLinkEmail(email, {
           redirectTo: options.redirectTo,
+          captchaToken: options.captchaToken,
         })
-        return { data: null, user: null, session: null, error }
+        return { user: null, session: null, error }
       }
       if (email && password) {
         return this._handleEmailSignIn(email, password, {
@@ -201,11 +211,12 @@ export default class GoTrueClient {
         })
       }
       if (phone && !password) {
-        const { error } = await this.api.sendMobileOTP(phone)
-        return { data: null, user: null, session: null, error }
+        const { error } = await this.api.sendMobileOTP(phone, {
+          captchaToken: options.captchaToken,
+        })
+        return { user: null, session: null, error }
       }
       if (phone && password) {
-        // @ts-ignore - phone is a string
         return this._handlePhoneSignIn(phone, password)
       }
       if (refreshToken) {
@@ -214,7 +225,6 @@ export default class GoTrueClient {
         if (error) throw error
 
         return {
-          data: this.currentSession,
           user: this.currentUser,
           session: this.currentSession,
           error: null,
@@ -228,7 +238,7 @@ export default class GoTrueClient {
       }
       throw new Error(`You must provide either an email, phone number or a third-party provider.`)
     } catch (e) {
-      return { data: null, user: null, session: null, error: e as ApiError }
+      return { user: null, session: null, error: e as ApiError }
     }
   }
 
@@ -247,7 +257,6 @@ export default class GoTrueClient {
     user: User | null
     session: Session | null
     error: ApiError | null
-    data: Session | User | null // Deprecated
   }> {
     try {
       this._removeSession()
@@ -276,9 +285,9 @@ export default class GoTrueClient {
         user = data as User
       }
 
-      return { data, user, session, error: null }
+      return { user, session, error: null }
     } catch (e) {
-      return { data: null, user: null, session: null, error: e as ApiError }
+      return { user: null, session: null, error: e as ApiError }
     }
   }
 
@@ -365,7 +374,7 @@ export default class GoTrueClient {
       this._notifyAllSubscribers('SIGNED_IN')
       return { session: data, error: null }
     } catch (e) {
-      return { session: null, error: e as ApiError }
+      return { error: e as ApiError, session: null }
     }
   }
 
@@ -424,8 +433,9 @@ export default class GoTrueClient {
       }
       if (options?.storeSession) {
         this._saveSession(session)
+        const recoveryMode = getParameterByName('type')
         this._notifyAllSubscribers('SIGNED_IN')
-        if (getParameterByName('type') === 'recovery') {
+        if (recoveryMode === 'recovery') {
           this._notifyAllSubscribers('PASSWORD_RECOVERY')
         }
       }
@@ -439,7 +449,7 @@ export default class GoTrueClient {
   }
 
   /**
-   * Inside a browser context, `signOut()` will remove extract the logged in user from the browser session
+   * Inside a browser context, `signOut()` will remove the logged in user from the browser session
    * and log them out - removing all items from localstorage and then trigger a "SIGNED_OUT" event.
    *
    * For server-side management, you can disable sessions by passing a JWT through to `auth.api.signOut(JWT: string)`
@@ -618,6 +628,7 @@ export default class GoTrueClient {
       if (!data) throw Error('Invalid session data.')
 
       this._saveSession(data)
+      this._notifyAllSubscribers('TOKEN_REFRESHED')
       this._notifyAllSubscribers('SIGNED_IN')
 
       return { data, error: null }
@@ -674,6 +685,33 @@ export default class GoTrueClient {
     if (value <= 0 || !this.autoRefreshToken) return
 
     this.refreshTokenTimer = setTimeout(() => this._callRefreshToken(), value)
-    // if (typeof this.refreshTokenTimer.unref === 'function') this.refreshTokenTimer.unref()
+    if (typeof this.refreshTokenTimer.unref === 'function') this.refreshTokenTimer.unref()
+  }
+
+  /**
+   * Listens for changes to LocalStorage and updates the current session.
+   */
+  private _listenForMultiTabEvents() {
+    if (!this.multiTab || !isBrowser() || !window?.addEventListener) {
+      // console.debug('Auth multi-tab support is disabled.')
+      return false
+    }
+
+    try {
+      window?.addEventListener('storage', (e: StorageEvent) => {
+        if (e.key === STORAGE_KEY) {
+          const newSession = JSON.parse(String(e.newValue))
+          if (newSession?.currentSession?.access_token) {
+            this._recoverAndRefresh()
+            this._notifyAllSubscribers('SIGNED_IN')
+          } else {
+            this._removeSession()
+            this._notifyAllSubscribers('SIGNED_OUT')
+          }
+        }
+      })
+    } catch (error) {
+      console.error('_listenForMultiTabEvents', error)
+    }
   }
 }

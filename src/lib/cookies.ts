@@ -1,4 +1,3 @@
-// deno-lint-ignore-file no-explicit-any
 type Cookie = {
   name: string
   value: string
@@ -26,7 +25,7 @@ function serialize(
 ) {
   const opt = options || {}
   const enc = encodeURIComponent
-  // deno-lint-ignore no-control-regex
+  /* eslint-disable-next-line no-control-regex */
   const fieldContentRegExp = /^[\u0009\u0020-\u007e\u0080-\u00ff]+$/
 
   if (typeof enc !== 'function') {
@@ -141,9 +140,9 @@ function serializeCookie(cookie: Cookie, secure: boolean) {
 }
 
 /**
- * Set one or more cookies.
+ * Get Cookie Header strings.
  */
-export function setCookies(req: any, res: any, cookies: Array<Cookie>) {
+export function getCookieString(req: any, res: any, cookies: Array<Cookie>): string[] {
   const strCookies = cookies.map((c) => serializeCookie(c, isSecureEnvironment(req)))
   const previousCookies = res.getHeader('Set-Cookie')
   if (previousCookies) {
@@ -153,7 +152,14 @@ export function setCookies(req: any, res: any, cookies: Array<Cookie>) {
       strCookies.push(previousCookies)
     }
   }
-  res.setHeader('Set-Cookie', strCookies)
+  return strCookies
+}
+
+/**
+ * Set one or more cookies.
+ */
+export function setCookies(req: any, res: any, cookies: Array<Cookie>) {
+  res.setHeader('Set-Cookie', getCookieString(req, res, cookies))
 }
 
 /**
