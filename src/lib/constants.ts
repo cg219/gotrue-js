@@ -1,4 +1,4 @@
-import { version } from './version'
+import { version } from './version.ts'
 export const GOTRUE_URL = 'http://localhost:9999'
 export const AUDIENCE = ''
 export const DEFAULT_HEADERS = { 'X-Client-Info': `gotrue-js/${version}` }
